@@ -34,12 +34,13 @@ long mp3_to_float(const char* filename, float** output, int* sample_rate,
   long filesize = ftell(fp);
   fseek(fp, 0, SEEK_SET);
 
-  unsigned char* mp3_buffer = (unsigned char*)malloc(filesize);
+  unsigned char* mp3_buffer = (unsigned char*)malloc(filesize + MAD_BUFFER_GUARD);
   if (!mp3_buffer) {
     perror("unable to allocate memory for mp3 buffer");
     fclose(fp);
     return -1;
   }
+  memset(mp3_buffer + filesize, 0, MAD_BUFFER_GUARD);
   fread(mp3_buffer, 1, filesize, fp);
   fclose(fp);
 
@@ -118,6 +119,13 @@ long mp3_to_float(const char* filename, float** output, int* sample_rate,
   }
 
   // set arguments to values read
+  float max_val = 0.0f;
+  for (long i = 0; i < decoded_size; i++) {
+    if (fabsf(decoded_data[i]) > max_val)
+        max_val = fabsf(decoded_data[i]);
+  }
+  printf("Max decoded amplitude: %f\n", max_val);
+
   *output = decoded_data;
   *sample_rate = sr;
   *channels = ch;
@@ -198,13 +206,12 @@ int float_to_mp3(const char* filename, const float* input, long num_samples,
 
     // input is apparently interleaved via libmad so looks like [L, R, L, R...]
     // have to split intoseparate arrays for L and R
-    for (int i = 0; i < num_samples; i++) {
-      left[i] = input[2 * i];       // L
-      right[i] = input[2 * i + 1];  // R
+    int frame_count = num_samples / 2;
+    for (int i = 0; i < frame_count; i++) {
+      left[i] = input[2 * i];
+      right[i] = input[2 * i + 1];
     }
-
-    write_size = lame_encode_buffer_ieee_float(lame, left, right, num_samples,
-                                               mp3buf, mp3buf_size);
+    write_size = lame_encode_buffer_ieee_float(lame, left, right, frame_count, mp3buf, mp3buf_size);
 
     free(left);
     free(right);

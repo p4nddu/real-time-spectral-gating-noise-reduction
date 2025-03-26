@@ -14,7 +14,7 @@ typedef struct {
     int hop_size;
     float alpha; // gating threshold
     float noise_floor; // minimal gain floor
-    // float noise_decay; // smoothing factor 0-1; (eg. 0.9 = 90% old and 10% new)
+    float noise_decay; // smoothing factor 0-1; (eg. 0.9 = 90% old and 10% new)
     float silence_threshold; //e enrgy threshold to consider frame as silence, if negative, auto calibration used
 }SpectralGateConfig;
 

@@ -90,12 +90,19 @@ int spectral_gate_start(SpectralGateData* spd, const float* input, float* output
     int hop_size = spd->config.hop_size;
     float alpha = spd->config.alpha;
     float noise_floor_gain = db_to_gain(spd->config.noise_floor);
-    // float noise_decay = spd->config.noise_decay;
+    float noise_decay = spd->config.noise_decay;
     float silence_threshold = spd->config.silence_threshold;
+
+    // VAD and smoothing parameters
+    const float vad_threshold_high = silence_threshold * 1.5f;  // Speech threshold
+    const float vad_threshold_low = silence_threshold * 0.75f;  // Silence threshold
+    const float vad_smoothing = 0.9f;  // Energy smoothing factor
+    float smoothed_energy = 0.0f;
+    int is_silence = 1;
 
     memset(output, 0, sizeof(float) * num_samples);
 
-    // initialize FFT buffers here
+    // allocating FFT buffers
     kiss_fft_scalar* in_buf = (kiss_fft_scalar*)malloc(frame_size * sizeof(kiss_fft_scalar));
     kiss_fft_cpx* freq_bins = (kiss_fft_cpx*)malloc((frame_size / 2 + 1) * sizeof(kiss_fft_cpx));
     kiss_fft_cpx* out_freq_bins = (kiss_fft_cpx*)malloc((frame_size / 2 + 1) * sizeof(kiss_fft_cpx));
@@ -110,79 +117,80 @@ int spectral_gate_start(SpectralGateData* spd, const float* input, float* output
         return -1;
     }
 
-    // short-time fourier transform loop
     long pos = 0;
-    while (pos + frame_size <= num_samples) {
-        // compute average energy for the frame for VAD, issilent = 1 when frame is below silent threshold
+    while (pos < num_samples) {  // Handle partial frames
+        int current_frame_size = frame_size;
+        if (pos + frame_size > num_samples) {
+            current_frame_size = num_samples - pos;
+        }
+
+        // window the audio signal and calculate frame energy for VAD
         float frame_energy = 0.0f;
-        int is_silence = 0;
-
-        for (int i = 0; i < frame_size; i++) {
-            frame_energy += input[pos + i] * input[pos + i];
-        }
-        frame_energy /= frame_size;
-
-        float gamma = 0.2f; // silence threshold updating smoothing factor
-        if (frame_energy < spd->config.silence_threshold) {
-            spd->config.silence_threshold = (1.0f - gamma) * spd->config.silence_threshold + gamma * frame_energy;
-        }
-
-        if(frame_energy < spd->config.silence_threshold) is_silence = 1;
-
-        // copy the hann windows into in_buf
-        for (int i = 0; i < frame_size; i++) {
+        memset(in_buf, 0, frame_size * sizeof(kiss_fft_scalar));
+        for (int i = 0; i < current_frame_size; i++) {
             in_buf[i] = (kiss_fft_scalar)(input[pos + i] * spd->window[i]);
+            frame_energy += in_buf[i] * in_buf[i];
+        }
+        frame_energy /= current_frame_size;  // Normalize
+
+        // update smoothed energy with exponential moving average
+        smoothed_energy = vad_smoothing * smoothed_energy + (1 - vad_smoothing) * frame_energy;
+
+        if (is_silence) {
+            if (smoothed_energy > vad_threshold_high) {
+                is_silence = 0;
+            }
+        } else {
+            if (smoothed_energy < vad_threshold_low) {
+                is_silence = 1;
+            }
         }
 
         // forward fft (real to complex)
         kiss_fftr(spd->fwd_cfg, in_buf, freq_bins);
 
-        // weiner filter soft thresholding and minima tracking
+        // fill in frequency bins
         for (int j = 0; j < (frame_size / 2 + 1); j++) {
             float re = freq_bins[j].r;
             float im = freq_bins[j].i;
-            float mag2 = re*re + im*im; // square rooting is taxing on cycles
-
+            float mag = sqrtf(re*re + im*im);
+            
+            // if frame is silent, update noise estimates
             if (is_silence) {
-                // good to update noise estimate 
-                float noise_est_squared = spd->noise_est[j] * spd->noise_est[j];
-        
-                if (mag2 < noise_est_squared) {
-                    spd->noise_est[j] = sqrtf(mag2);  // update noise estimate (linear magnitude)
-                }
+                spd->noise_est[j] = noise_decay * spd->noise_est[j] + (1.0f - noise_decay) * mag;
             }
 
-            // weiner gain calcualtion. take into account SNR for smoother noise reduction
-            float noise2 = spd->noise_est[j] * spd->noise_est[j];
-            float SNR = (mag2 - noise2) / (noise2 + 1e-10f);
-            if (SNR < 0) SNR = 0;
+            // noise gating
+            float threshold = alpha * spd->noise_est[j];
+            if (mag < threshold) {
+                mag *= noise_floor_gain;
+            }
 
-            float gain = SNR / (1.0f + SNR);
-            gain = fmaxf(gain, noise_floor_gain);
-
-            out_freq_bins[j].r = freq_bins[j].r * gain;
-            out_freq_bins[j].i = freq_bins[j].i * gain;
-
+            // making sure phase is preserved - takes up cycles might have to change when using the MCU
+            float phase = atan2f(im, re);
+            out_freq_bins[j].r = mag * cosf(phase);
+            out_freq_bins[j].i = mag * sinf(phase);
         }
 
         // inverse fft (complex to real)
         kiss_fftri(spd->inv_cfg, out_freq_bins, time_buf);
 
-        // re window the time_buf for synthesis and overlap
+        // overlap add for smoother transition between frames
+        const float scale = 1.0f / frame_size;  // FFT scaling
         for (int i = 0; i < frame_size; i++) {
-            float val = (time_buf[i] / frame_size) * spd->window[i];
-            float outval = val + spd->overlap[i];
-
-            output[pos + i] += outval;
-
-            spd->overlap[i] = 0.0f; // just do overlap of zero right neow
+            float val = time_buf[i] * scale * spd->window[i];
+            if (pos + i < num_samples) {
+                output[pos + i] += val + spd->overlap[i];
+            }
         }
 
-        int shift = frame_size - hop_size;
-        for (int i = 0; i < shift; i++) {
-            spd->overlap[i] = (time_buf[i + hop_size] / frame_size) * spd->window[i + hop_size];
+        // update overlap buffer
+        int overlap_size = frame_size - hop_size;
+        for (int i = 0; i < overlap_size; i++) {
+            spd->overlap[i] = time_buf[i + hop_size] * scale * spd->window[i + hop_size];
         }
-        for (int i = shift; i < frame_size; i++) {
+        // clear remaining overlap in buffer
+        for (int i = overlap_size; i < frame_size; i++) {
             spd->overlap[i] = 0.0f;
         }
 
